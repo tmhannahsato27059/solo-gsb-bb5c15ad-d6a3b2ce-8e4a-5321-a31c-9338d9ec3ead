@@ -32,6 +32,8 @@ from .schemas import (
     RunwaySwapOut,
     RunwayTrialOut,
     RunwayJointOut,
+    SlotInsertRequest,
+    SlotInsertResponse,
     SwapChoiceOut,
     TrialBlockedOut,
     TrialItemOut,
@@ -42,12 +44,15 @@ from .schemas import (
 )
 from .separation import ClosureWindow, delay_stats
 from .service import (
+    SlotBaselineError,
     nested_matrix,
     run_best_adjacent_swap,
     run_joint_trial,
+    run_slot_insert,
     run_trial,
     run_validate,
 )
+from .timeutils import ensure_utc
 from .config import settings
 
 
@@ -72,8 +77,13 @@ app = FastAPI(
         "确定跨跑道全局稳定顺序，再逐项求同时满足本跑道尾流/关闭窗口/滚动"
         "容量与组内最小占用间隔的最早时刻（任一约束推迟后全部约束重新检查"
         "直至收敛），锁定航班需要后移时返回首个阻塞航班及各约束所需时刻。"
+        "slots/insert 针对单条跑道评估候选航班插入：现有计划违反尾流/关闭"
+        "窗口/容量约束时返回 422；否则保持现有航班时刻不变，按（离场时刻、"
+        "航班号）确定插入位次，求候选区间内最早可行的 UTC 时刻（同时满足"
+        "插入前后相邻尾流间隔、关闭窗口与插入后全序列滚动容量），找不到时"
+        "返回明确的无空档结果；该接口为只读查询，不改写计划或批次。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -96,6 +106,7 @@ def root() -> dict:
             "trial": "POST /api/v1/trial",
             "best_adjacent_swap": "POST /api/v1/trial/best-adjacent-swap",
             "joint_trial": "POST /api/v1/trial/joint",
+            "slot_insert": "POST /api/v1/slots/insert",
             "batch": "GET /api/v1/batches/{batch_id}",
         },
     }
@@ -779,6 +790,53 @@ def joint_trial_endpoint(
         runways=runway_outs,
         has_locks=bool(locked_runways),
         total_locked=total_locked,
+    )
+
+
+@app.post("/api/v1/slots/insert", response_model=SlotInsertResponse, tags=["slots"])
+def insert_slot_endpoint(req: SlotInsertRequest) -> SlotInsertResponse:
+    """单跑道候选航班插入（只读查询，不改写计划或批次）。
+
+    先校验现有计划：若现有航班本身违反尾流间隔、落入关闭窗口或超出滚动
+    容量，返回 422 及违规明细。否则保持现有航班时刻不变，按
+    （离场时刻, 航班号）稳定顺序确定插入位次，在候选区间
+    ``[earliest_off, latest_off]``（含两端，精确到整秒）内求最早可行的
+    UTC 时刻——需同时满足插入前后相邻尾流间隔、关闭窗口避让与插入后
+    全序列的滚动容量；找不到时返回明确的无空档结果（`feasible=false`，
+    并给出满足全部约束的全局最早时刻 `earliest_feasible_off`）。
+    """
+    try:
+        result, matrix = run_slot_insert(req)
+    except SlotBaselineError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    earliest_utc = ensure_utc(req.candidate.earliest_off)
+    latest_utc = ensure_utc(req.candidate.latest_off)
+    assigned_iso = result.assigned_off.isoformat().replace("+00:00", "Z")
+    latest_iso = latest_utc.isoformat().replace("+00:00", "Z")
+    if result.feasible:
+        reason = (
+            f"区间内存在可行空档：最早可行时刻 {assigned_iso}，"
+            f"插入位次 {result.position}"
+        )
+    else:
+        reason = (
+            "区间内无可行空档：满足全部约束的最早时刻为 "
+            f"{assigned_iso}，晚于候选最晚离场时刻 {latest_iso}"
+        )
+    return SlotInsertResponse(
+        runway=req.runway.runway,
+        candidate_flight_no=req.candidate.flight_no,
+        candidate_wake=req.candidate.wake,
+        earliest_off=earliest_utc,
+        latest_off=latest_utc,
+        feasible=result.feasible,
+        reason=reason,
+        earliest_feasible_off=result.assigned_off,
+        insert_position=result.position if result.feasible else None,
+        assigned_off=result.assigned_off if result.feasible else None,
+        inserted_order=list(result.order) if result.feasible else None,
+        matrix=nested_matrix(matrix),
     )
 
 

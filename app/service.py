@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-from .schemas import JointTrialRequest, WakeRequest, matrix_to_nested
+from .schemas import (
+    JointTrialRequest,
+    SlotInsertRequest,
+    WakeRequest,
+    matrix_to_nested,
+)
 from .joint import JointTrialResult, MutexGroup, joint_trial
 from .separation import (
     Capacity,
     ClosureConflict,
     ClosureWindow,
     Flight,
+    SlotInsertResult,
     SwapRunwayResult,
     TrialRunwayResult,
     Violation,
@@ -16,6 +22,7 @@ from .separation import (
     build_matrix,
     find_capacity_violations,
     find_closure_conflicts,
+    find_insert_slot,
     find_violations,
     sort_flights,
     sort_windows,
@@ -88,7 +95,9 @@ def _build_runway_capacities(req: WakeRequest) -> dict[str, Capacity]:
     }
 
 
-def _matrix_from_request(req: WakeRequest) -> dict[tuple[str, str], int]:
+def _matrix_from_request(
+    req: WakeRequest | SlotInsertRequest,
+) -> dict[tuple[str, str], int]:
     if req.matrix is None:
         return build_matrix(None)
     return build_matrix(
@@ -195,6 +204,100 @@ def run_best_adjacent_swap(req: WakeRequest) -> tuple[
 
 def nested_matrix(matrix: dict[tuple[str, str], int]) -> dict[str, dict[str, int]]:
     return matrix_to_nested(matrix)
+
+
+class SlotBaselineError(Exception):
+    """现有计划本身违反尾流间隔、关闭窗口或滚动容量约束（API 层转为 422）。"""
+
+
+def _baseline_error_message(
+    violations: list[Violation],
+    conflicts: list[ClosureConflict],
+    capacity_violations: list,
+) -> str:
+    parts: list[str] = []
+    if violations:
+        first = violations[0]
+        parts.append(
+            f"尾流间隔违规 {len(violations)} 起"
+            f"（首个：{first.leader_no}→{first.follower_no} 要求 "
+            f"{first.required_seconds} 秒、实际 {first.actual_seconds} 秒）"
+        )
+    if conflicts:
+        first = conflicts[0]
+        parts.append(
+            f"关闭窗口冲突 {len(conflicts)} 起"
+            f"（首个：{first.flight_no} 计划于 "
+            f"{first.scheduled_off.isoformat()} 落入窗口 "
+            f"[{first.window_start.isoformat()}, {first.window_end.isoformat()})）"
+        )
+    if capacity_violations:
+        first = capacity_violations[0]
+        parts.append(
+            f"滚动容量超限 {len(capacity_violations)} 起"
+            f"（首个：{first.flight_no} 于窗口 "
+            f"[{first.anchor_off.isoformat()}, {first.window_end.isoformat()}) 内"
+            f"超出 {first.window_seconds} 秒/{first.max_departures} 架限制）"
+        )
+    return "现有计划违反约束，无法评估插入：" + "；".join(parts)
+
+
+def run_slot_insert(
+    req: SlotInsertRequest,
+) -> tuple[SlotInsertResult, dict[tuple[str, str], int]]:
+    """单跑道候选插入：先校验现有计划可行，再求区间内最早可行时刻。
+
+    现有航班时刻保持不变；只读计算，不落库、不改写任何计划或批次。
+    现有计划违反尾流/关闭窗口/容量约束时抛出 :class:`SlotBaselineError`。
+    """
+    rw = req.runway
+    flights = sort_flights(
+        [
+            Flight(
+                flight_no=f.flight_no,
+                scheduled_off=ensure_utc(f.scheduled_off),
+                wake=f.wake.value,
+                locked=f.locked,
+                runway=rw.runway,
+            )
+            for f in rw.flights
+        ]
+    )
+    windows = sort_windows(
+        [
+            ClosureWindow(start=ensure_utc(w.start), end=ensure_utc(w.end))
+            for w in rw.closures
+        ]
+    )
+    capacity = (
+        Capacity(
+            window_seconds=rw.capacity.window_seconds,
+            max_departures=rw.capacity.max_departures,
+        )
+        if rw.capacity is not None
+        else None
+    )
+    matrix = _matrix_from_request(req)
+
+    violations = find_violations(flights, matrix)
+    conflicts = find_closure_conflicts(flights, windows)
+    capacity_violations = find_capacity_violations(flights, capacity)
+    if violations or conflicts or capacity_violations:
+        raise SlotBaselineError(
+            _baseline_error_message(violations, conflicts, capacity_violations)
+        )
+
+    result = find_insert_slot(
+        flights,
+        candidate_flight_no=req.candidate.flight_no,
+        candidate_wake=req.candidate.wake.value,
+        earliest_off=ensure_utc(req.candidate.earliest_off),
+        latest_off=ensure_utc(req.candidate.latest_off),
+        matrix=matrix,
+        windows=windows,
+        capacity=capacity,
+    )
+    return result, matrix
 
 
 def _groups_from_request(req: JointTrialRequest) -> list[MutexGroup]:

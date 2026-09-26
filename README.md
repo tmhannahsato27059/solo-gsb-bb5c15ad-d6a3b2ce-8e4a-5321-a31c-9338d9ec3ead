@@ -29,6 +29,12 @@
    收敛。返回每项的首个触发约束、触发前序航班与延误。锁定航班若需后移则在该航班
    （全局首个阻塞）处停止：返回阻塞航班、首个触发约束、最终最早合规时刻及**各约束
    分别要求的时刻**（`required_times`），其后不再生成建议，仅持久化可行全局前缀。
+5. **候选插入查询（slots/insert）**：针对**单条跑道**评估一架候选航班能否插入现有
+   计划。现有计划本身违反尾流间隔、关闭窗口或滚动容量时返回 `422`；否则**保持现有
+   航班时刻不变**，按 `(离场时刻, 航班号)` 确定插入位次，在候选区间
+   `[earliest_off, latest_off]`（含两端、精确到整秒）内求**最早可行的 UTC 时刻**——
+   需同时满足插入前后相邻尾流间隔、关闭窗口避让与插入后全序列的滚动容量；找不到时
+   返回明确的无空档结果。该接口为**只读查询**，不改写计划、不产生批次。
 
 **兼容形状**：未在任何航班上传 `locked` 字段时，validate/trial/批次回查的响应与旧版本
 完全一致（不出现 `locked`、`locked_flights`、`blocked`、`total_locked` 字段）；显式传了
@@ -353,6 +359,58 @@ validate 额外返回**关闭冲突**：凡计划离场时刻落在某个窗口�
 结果以 `mode="joint_trial"` 持久化（输入计划、全局顺序、互斥组、可行前缀每项明细
 与 blocker 的各约束所需时刻一并入库），可用批次 ID 原样回查。
 
+### `POST /api/v1/slots/insert` — 单跑道候选插入查询
+
+请求体（单条跑道 + 候选航班 + 可选矩阵）：
+
+```json
+{
+  "runway": {
+    "runway": "36L",
+    "flights": [
+      {"flight_no": "CA1", "scheduled_off": "2026-09-18T08:00:00+08:00", "wake": "J"},
+      {"flight_no": "CA2", "scheduled_off": "2026-09-18T08:05:00+08:00", "wake": "M"}
+    ],
+    "closures": [
+      {"start": "2026-09-18T08:10:00+08:00", "end": "2026-09-18T08:20:00+08:00"}
+    ],
+    "capacity": {"window_seconds": 600, "max_departures": 2}
+  },
+  "candidate": {
+    "flight_no": "CA9",
+    "wake": "M",
+    "earliest_off": "2026-09-18T08:03:00+08:00",
+    "latest_off": "2026-09-18T08:30:00+08:00"
+  }
+}
+```
+
+- `runway`：与 validate/trial 相同的单跑道结构（`flights` 至少 1 架，跑道内航班号
+  唯一；`closures` / `capacity` 可选，规则相同）；`matrix` 语义与其它接口一致。
+- `candidate`：`flight_no`（**不得与现有航班重复**，否则 `422`）、`wake`，以及带时区的
+  `earliest_off` / `latest_off`——候选可离场区间为**闭区间**（含两端），
+  `earliest_off` 不得晚于 `latest_off`。
+- **本接口所有时刻（现有航班、关闭窗口、候选区间）必须精确到整秒**，携带毫秒/微秒
+  会被拒绝（`422`）。
+- 先校验现有计划：现有航班若违反相邻尾流间隔、落入关闭窗口或超出滚动容量，
+  返回 `422` 及各类违规数量与首个明细，不做插入评估。
+
+可行时（`feasible=true`）返回：
+
+- `assigned_off`：区间内**最早可行的 UTC 离场时刻**（与 `earliest_feasible_off` 相同）；
+- `insert_position`：插入位次（1 基，按 `(离场时刻, 航班号)` 稳定顺序确定）；
+- `inserted_order`：插入后的完整离场序列（现有航班时刻不变）。
+
+无空档时（`feasible=false`）返回明确的 `reason`，并给出
+`earliest_feasible_off`——满足全部约束的**全局最早时刻**（晚于 `latest_off`），
+`insert_position` / `assigned_off` / `inserted_order` 为 `null`。
+
+判定规则：候选时刻须同时满足 ① 与前一架（按插入位次）的尾流间隔、② 与后一架的
+尾流间隔、③ 不落入任何关闭窗口（`[start, end)`，可恰在 `end` 离场）、④ 插入后
+**全序列**的滚动容量（任意 `[t, t+window_seconds)` 内离场数 ≤ `max_departures`，
+含横跨候选的窗口）。该接口为**只读查询**：不写库、不产生 `batch_id`、不改写任何
+计划或批次。
+
 ### `GET /api/v1/batches/{batch_id}` — 批次回查
 
 所有 POST 接口（validate / trial / best-adjacent-swap / joint）的返回都带 `batch_id`，
@@ -396,7 +454,8 @@ capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的�
   关闭窗口结束不晚于开始或彼此重叠、容量字段非正整数、`locked` 非布尔值、
   互斥组引用不存在的跑道/组内跑道重复/同一跑道属于多个组/组少于 2 条跑道/
   组名重复/组间隔非正整数等），或 best-adjacent-swap 请求含任意 `locked=true`
-  航班，响应体含中文原因。
+  航班，或 slots/insert 请求中候选号与现有航班重复、候选最早时刻晚于最晚时刻、
+  时刻未精确到整秒、**现有计划本身违反尾流/关闭窗口/容量约束**，响应体含中文原因。
 - `404`：批次 ID 不存在。
 
 ---
@@ -432,6 +491,16 @@ curl -s -X POST http://localhost:8000/api/v1/trial/joint \
           {"flight_no": "MU1", "scheduled_off": "2026-09-18T00:00:30Z", "wake": "H"}]}],
        "groups": [{"runways": ["36L", "18R"], "min_interval_seconds": 90}]}'
 
+# 单跑道候选插入查询（只读；候选 CA9 最早 08:03、最晚 08:30）
+curl -s -X POST http://localhost:8000/api/v1/slots/insert \
+  -H 'Content-Type: application/json' \
+  -d '{"runway": {"runway": "36L", "flights": [
+          {"flight_no": "CA1", "scheduled_off": "2026-09-18T08:00:00+08:00", "wake": "J"},
+          {"flight_no": "CA2", "scheduled_off": "2026-09-18T08:05:00+08:00", "wake": "M"}]},
+       "candidate": {"flight_no": "CA9", "wake": "M",
+                     "earliest_off": "2026-09-18T08:03:00+08:00",
+                     "latest_off": "2026-09-18T08:30:00+08:00"}}'
+
 # 回查批次
 curl -s http://localhost:8000/api/v1/batches/<batch_id>
 ```
@@ -451,7 +520,7 @@ export WAKE_DB_PATH=./wake.db            # 可选，默认 /data/wake.db
 uvicorn app.main:app --reload --port 8000
 ```
 
-运行测试（含 119 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
+运行测试（含 149 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
 
 ```bash
 python3 -m pip install pytest httpx
@@ -462,11 +531,11 @@ python3 -m pytest -q
 
 ```
 app/
-  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / trial/joint / batches / 元信息）
-  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定/互斥组合法性与兼容序列化）
-  service.py      # 请求 -> 领域对象 -> 模式计算
+  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / trial/joint / slots/insert / batches / 元信息）
+  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定/互斥组/候选插入合法性与兼容序列化）
+  service.py      # 请求 -> 领域对象 -> 模式计算（含插入查询的现有计划 422 预检）
   joint.py        # 联合试排：全局稳定顺序、尾流/关闭/容量/互斥组间隔不动点迭代、锁定阻塞与各约束所需时刻
-  separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、锁定航班可行性（blocker）、相邻交换枚举择优、默认矩阵
+  separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、锁定航班可行性（blocker）、相邻交换枚举择优、候选插入空档搜索、默认矩阵
   timeutils.py    # 时区归一化（统一 UTC，整数秒运算）
   database.py     # SQLite 连接、建表与旧库迁移（含 batches.mode CHECK 重建、互斥组表与联合试排列）
   repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排/交换/联合试排（含互斥组与各约束所需时刻）的持久化与回查

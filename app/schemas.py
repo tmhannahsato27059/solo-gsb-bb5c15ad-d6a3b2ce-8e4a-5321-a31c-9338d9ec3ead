@@ -270,6 +270,91 @@ class JointTrialRequest(WakeRequest):
         ]
 
 
+class CandidateIn(BaseModel):
+    """The single candidate flight to insert into a runway's schedule."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    flight_no: str = Field(..., min_length=1, examples=["CA1999"])
+    wake: Wake = Field(..., description="候选航班尾流等级: L 轻型 / M 中型 / H 重型 / J 超重型")
+    earliest_off: datetime = Field(
+        ..., description="候选最早离场时刻（含），ISO 8601，必须带时区且精确到整秒"
+    )
+    latest_off: datetime = Field(
+        ..., description="候选最晚离场时刻（含），ISO 8601，必须带时区且精确到整秒"
+    )
+
+    @field_validator("flight_no")
+    @classmethod
+    def _strip_flight_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("flight_no 不能为空")
+        return v
+
+    @field_validator("earliest_off", "latest_off")
+    @classmethod
+    def _require_timezone(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("候选最早/最晚离场时刻必须携带时区信息（ISO 8601 offset 或 Z）")
+        return v
+
+
+class SlotInsertRequest(BaseModel):
+    """单跑道候选插入请求：现有计划 + 关闭窗口 + 滚动容量 + 间隔矩阵 + 候选航班。
+
+    所有时刻必须精确到整秒；候选可离场区间为
+    ``[earliest_off, latest_off]`` 闭区间（含两端）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    runway: RunwayIn = Field(..., description="单条跑道的现有航班、关闭窗口与滚动容量")
+    candidate: CandidateIn = Field(..., description="待插入的候选航班")
+    matrix: list[MatrixEntryIn] | None = Field(
+        default=None,
+        description="前机—后机最小间隔矩阵；缺省使用内置 ICAO 风格默认矩阵。"
+        "提供时仅列出的组合生效，未列出的组合视为无最小间隔(0 秒)。",
+    )
+
+    @model_validator(mode="after")
+    def _validate_insert(self) -> SlotInsertRequest:
+        existing = {f.flight_no for f in self.runway.flights}
+        if self.candidate.flight_no in existing:
+            raise ValueError(
+                f"候选航班号与现有航班重复: {self.candidate.flight_no}（候选号须唯一）"
+            )
+        if self.candidate.earliest_off > self.candidate.latest_off:
+            raise ValueError("候选最早离场时刻不能晚于最晚离场时刻（区间含两端）")
+        for label, moment in self._all_moments():
+            if moment.microsecond != 0:
+                raise ValueError(f"时刻必须精确到整秒（不允许毫秒/微秒）: {label}")
+        if self.matrix is not None:
+            pairs: set[tuple[str, str]] = set()
+            for entry in self.matrix:
+                pair = (entry.leader.value, entry.follower.value)
+                if pair in pairs:
+                    raise ValueError(
+                        f"间隔矩阵组合重复: leader={pair[0]} follower={pair[1]}"
+                    )
+                pairs.add(pair)
+        return self
+
+    def _all_moments(self) -> list[tuple[str, datetime]]:
+        moments: list[tuple[str, datetime]] = [
+            (f"航班 {f.flight_no} 的 scheduled_off", f.scheduled_off)
+            for f in self.runway.flights
+        ]
+        moments += [
+            (f"关闭窗口 {label}", moment)
+            for w in self.runway.closures
+            for label, moment in (("start", w.start), ("end", w.end))
+        ]
+        moments.append(("候选 earliest_off", self.candidate.earliest_off))
+        moments.append(("候选 latest_off", self.candidate.latest_off))
+        return moments
+
+
 # ---------- response models ----------
 
 
@@ -667,6 +752,32 @@ class BestAdjacentSwapResponse(BaseModel):
     total_delay_seconds: int
     total_saved_seconds: int
     runways: list[RunwaySwapOut]
+
+
+class SlotInsertResponse(BaseModel):
+    """候选插入结果：可行时给出最早可行 UTC 时刻与插入位次，否则给出无空档原因。"""
+
+    runway: str
+    candidate_flight_no: str
+    candidate_wake: Wake
+    earliest_off: datetime = Field(..., description="候选最早离场时刻（UTC 回显）")
+    latest_off: datetime = Field(..., description="候选最晚离场时刻（UTC 回显）")
+    feasible: bool
+    reason: str
+    # 满足全部约束的全局最早时刻；可行时与 assigned_off 相同，
+    # 无可行空档时该时刻晚于 latest_off。
+    earliest_feasible_off: datetime
+    # 以下字段仅在 feasible=true 时给出，否则为 null。
+    insert_position: int | None = Field(
+        default=None, description="插入后在全序列中的位次（1 基，按 离场时刻, 航班号 排序）"
+    )
+    assigned_off: datetime | None = Field(
+        default=None, description="区间内最早可行的 UTC 离场时刻"
+    )
+    inserted_order: list[str] | None = Field(
+        default=None, description="插入后的完整离场序列（航班号）"
+    )
+    matrix: dict[str, dict[str, int]]
 
 
 class MutexGroupOut(BaseModel):

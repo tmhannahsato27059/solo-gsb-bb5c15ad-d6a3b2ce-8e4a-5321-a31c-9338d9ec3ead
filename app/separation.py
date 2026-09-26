@@ -639,3 +639,162 @@ def best_adjacent_swap(
         optimized_order=optimized_order,
         optimized=optimized,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class SlotInsertResult:
+    """Outcome of an insertion-slot search for one candidate flight.
+
+    ``assigned_off`` is the earliest instant (UTC, whole seconds) at which
+    the candidate can be inserted without disturbing the existing schedule;
+    ``feasible`` tells whether that instant falls inside the caller's
+    ``[earliest_off, latest_off]`` window (both ends included). ``position``
+    is the 1-based slot in the post-insertion departure order and ``order``
+    the resulting flight-number sequence.
+    """
+
+    feasible: bool
+    assigned_off: datetime
+    position: int
+    order: tuple[str, ...]
+
+
+def find_insert_slot(
+    flights: list[Flight],
+    candidate_flight_no: str,
+    candidate_wake: str,
+    earliest_off: datetime,
+    latest_off: datetime,
+    matrix: dict[tuple[str, str], int],
+    windows: list[ClosureWindow] | None = None,
+    capacity: Capacity | None = None,
+) -> SlotInsertResult:
+    """Earliest feasible insertion of one candidate into a feasible schedule.
+
+    The existing schedule is left untouched: the candidate is placed at the
+    earliest whole second ``t >= earliest_off`` such that, with the candidate
+    inserted at the slot given by the stable ``(time, flight_no)`` ordering,
+    the full post-insertion sequence keeps every adjacent wake gap, the
+    candidate stays outside all closure windows and the rolling capacity
+    limit holds over the whole sequence. ``feasible`` is ``True`` iff that
+    earliest instant is not later than ``latest_off`` (the window is
+    inclusive on both ends); when it is not, ``assigned_off`` still carries
+    the earliest constraint-satisfying instant beyond the window.
+
+    The search walks the insertion slots (before the first flight, between
+    neighbours, after the last) in order. Within a slot the admissible
+    instants form a contiguous range: a lower bound from the ordering, the
+    predecessor's wake gap, closure-window avoidance and the capacity anchor
+    (the ``max_departures``-th departure ahead), and an upper bound from the
+    successor's wake gap and the packed capacity window the candidate would
+    head. A slot is skipped when its lower bound exceeds its upper bound or
+    when it straddles an already packed capacity window (infeasible for
+    every instant). The first feasible slot yields the globally earliest
+    instant, because every later slot starts at or after this slot's
+    successor's time.
+
+    Precondition: the existing schedule itself satisfies all three
+    constraint families (the API answers 422 otherwise), and the candidate
+    flight number differs from every existing one.
+    """
+    ordered = sort_flights(flights)
+    wins = sort_windows(windows or [])
+    n = len(ordered)
+    times = [f.t for f in ordered]
+    wakes = [f.wake for f in ordered]
+    numbers = [f.flight_no for f in ordered]
+    earliest_t = to_epoch_seconds(earliest_off)
+    latest_t = to_epoch_seconds(latest_off)
+    k = capacity.max_departures if capacity is not None else 0
+    span = capacity.window_seconds if capacity is not None else 0
+
+    slot = 0
+    while slot <= n:
+        # Fresh lower bound for this slot: the user's earliest instant and
+        # the ordering (not earlier than the previous flight's time).
+        t = earliest_t
+        if slot > 0 and times[slot - 1] > t:
+            t = times[slot - 1]
+        while True:
+            # Ordering tie with the previous flight: at this exact instant
+            # the candidate would sort before it, so the instant itself is
+            # infeasible — try one second later.
+            if (
+                slot > 0
+                and t == times[slot - 1]
+                and candidate_flight_no <= numbers[slot - 1]
+            ):
+                t = times[slot - 1] + 1
+                continue
+            # Past the next flight's time (or exactly on it while sorting
+            # after it): the candidate belongs to a later slot.
+            if slot < n and (
+                t > times[slot]
+                or (t == times[slot] and candidate_flight_no >= numbers[slot])
+            ):
+                break
+            # Wake separation behind the previous flight.
+            if slot > 0:
+                bound = times[slot - 1] + required_gap(
+                    matrix, wakes[slot - 1], candidate_wake
+                )
+                if t < bound:
+                    t = bound
+                    continue
+            # Closure windows (sorted, non-overlapping; touching windows
+            # chain exactly like the trial engine).
+            pushed = False
+            for window in wins:
+                if t < window.s:
+                    break
+                if window.contains(t):
+                    t = window.e
+                    pushed = True
+                    break
+            if pushed:
+                continue
+            # Rolling capacity: the candidate must not become the
+            # (max_departures + 1)-th departure inside the window anchored
+            # at the max_departures-th flight ahead of it.
+            if capacity is not None and slot >= k:
+                bound = times[slot - k] + span
+                if t < bound:
+                    t = bound
+                    continue
+            # Rolling capacity: a window anchored before the candidate and
+            # reaching past it (existing flights on both sides) is infeasible
+            # for every instant of this slot.
+            if capacity is not None:
+                straddled = False
+                for m in range(max(0, slot - k + 1), min(slot - 1, n - k) + 1):
+                    if times[m + k - 1] - times[m] < span:
+                        straddled = True
+                        break
+                if straddled:
+                    break
+            # Upper bounds: the successor's wake gap and the packed capacity
+            # window the candidate would head (the user's ``latest`` is
+            # applied to the result, not to the search).
+            upper: int | None = None  # None = unbounded (slot after the last flight)
+            if slot < n:
+                upper = times[slot] - required_gap(
+                    matrix, candidate_wake, wakes[slot]
+                )
+            if capacity is not None and slot + k <= n:
+                bound = times[slot + k - 1] - span
+                upper = bound if upper is None else min(upper, bound)
+            if upper is None or t <= upper:
+                order = (
+                    tuple(numbers[:slot])
+                    + (candidate_flight_no,)
+                    + tuple(numbers[slot:])
+                )
+                return SlotInsertResult(
+                    feasible=t <= latest_t,
+                    assigned_off=datetime.fromtimestamp(t, tz=timezone.utc),
+                    position=slot + 1,
+                    order=order,
+                )
+            break  # slot infeasible for every remaining instant -> next slot
+        slot += 1
+    raise AssertionError("unreachable: the slot after the last flight is unbounded")
