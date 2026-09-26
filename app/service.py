@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
-from .schemas import JointTrialRequest, WakeRequest, matrix_to_nested
+from .schemas import (
+    JointTrialRequest,
+    MatrixEntryIn,
+    SlotInsertRequest,
+    WakeRequest,
+    matrix_to_nested,
+)
 from .joint import JointTrialResult, MutexGroup, joint_trial
 from .separation import (
     Capacity,
+    CapacityViolation,
     ClosureConflict,
     ClosureWindow,
     Flight,
+    InsertSlotResult,
     SwapRunwayResult,
     TrialRunwayResult,
     Violation,
@@ -16,12 +24,13 @@ from .separation import (
     build_matrix,
     find_capacity_violations,
     find_closure_conflicts,
+    find_insert_slot,
     find_violations,
     sort_flights,
     sort_windows,
     trial_reschedule,
 )
-from .timeutils import ensure_utc
+from .timeutils import ensure_utc, to_epoch_seconds
 
 
 def _build_runway_flights(req: WakeRequest) -> dict[str, list[Flight]]:
@@ -88,12 +97,16 @@ def _build_runway_capacities(req: WakeRequest) -> dict[str, Capacity]:
     }
 
 
-def _matrix_from_request(req: WakeRequest) -> dict[tuple[str, str], int]:
-    if req.matrix is None:
+def _matrix_from_entries(
+    entries: list[MatrixEntryIn] | None,
+) -> dict[tuple[str, str], int]:
+    if entries is None:
         return build_matrix(None)
-    return build_matrix(
-        {(e.leader.value, e.follower.value): e.seconds for e in req.matrix}
-    )
+    return build_matrix({(e.leader.value, e.follower.value): e.seconds for e in entries})
+
+
+def _matrix_from_request(req: WakeRequest) -> dict[tuple[str, str], int]:
+    return _matrix_from_entries(req.matrix)
 
 
 def run_validate(req: WakeRequest) -> tuple[
@@ -195,6 +208,80 @@ def run_best_adjacent_swap(req: WakeRequest) -> tuple[
 
 def nested_matrix(matrix: dict[tuple[str, str], int]) -> dict[str, dict[str, int]]:
     return matrix_to_nested(matrix)
+
+
+class ExistingPlanInvalid(Exception):
+    """The submitted schedule already violates wake/closure/capacity rules.
+
+    Carries the full violation detail; the API layer maps it to 422.
+    """
+
+    def __init__(
+        self,
+        violations: list[Violation],
+        closure_conflicts: list[ClosureConflict],
+        capacity_violations: list[CapacityViolation],
+    ) -> None:
+        super().__init__("现有计划违反尾流间隔、关闭窗口或滚动容量约束")
+        self.violations = violations
+        self.closure_conflicts = closure_conflicts
+        self.capacity_violations = capacity_violations
+
+
+def run_slot_insert(
+    req: SlotInsertRequest,
+) -> tuple[dict[tuple[str, str], int], InsertSlotResult]:
+    """Validate the existing plan, then find the candidate's earliest slot.
+
+    Raises :class:`ExistingPlanInvalid` when the submitted schedule already
+    breaches wake separation, a closure window or the rolling capacity
+    limit. The query is read-only: existing times are never changed and
+    nothing is persisted.
+    """
+    runway = req.runway
+    flights = sort_flights(
+        [
+            Flight(
+                flight_no=f.flight_no,
+                scheduled_off=ensure_utc(f.scheduled_off),
+                wake=f.wake.value,
+                locked=f.locked,
+                runway=runway.runway,
+            )
+            for f in runway.flights
+        ]
+    )
+    windows = sort_windows(
+        [
+            ClosureWindow(start=ensure_utc(w.start), end=ensure_utc(w.end))
+            for w in runway.closures
+        ]
+    )
+    capacity = (
+        Capacity(
+            window_seconds=runway.capacity.window_seconds,
+            max_departures=runway.capacity.max_departures,
+        )
+        if runway.capacity is not None
+        else None
+    )
+    matrix = _matrix_from_entries(req.matrix)
+    violations = find_violations(flights, matrix)
+    conflicts = find_closure_conflicts(flights, windows)
+    capacity_violations = find_capacity_violations(flights, capacity)
+    if violations or conflicts or capacity_violations:
+        raise ExistingPlanInvalid(violations, conflicts, capacity_violations)
+    result = find_insert_slot(
+        flights,
+        matrix,
+        windows,
+        capacity,
+        candidate_no=req.candidate.flight_no,
+        candidate_wake=req.candidate.wake.value,
+        earliest=to_epoch_seconds(ensure_utc(req.candidate.earliest_off)),
+        latest=to_epoch_seconds(ensure_utc(req.candidate.latest_off)),
+    )
+    return matrix, result
 
 
 def _groups_from_request(req: JointTrialRequest) -> list[MutexGroup]:

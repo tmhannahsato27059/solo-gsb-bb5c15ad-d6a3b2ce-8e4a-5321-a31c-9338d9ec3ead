@@ -29,13 +29,19 @@
    收敛。返回每项的首个触发约束、触发前序航班与延误。锁定航班若需后移则在该航班
    （全局首个阻塞）处停止：返回阻塞航班、首个触发约束、最终最早合规时刻及**各约束
    分别要求的时刻**（`required_times`），其后不再生成建议，仅持久化可行全局前缀。
+5. **单跑道插空查询（slots/insert，纯查询）**：针对单条跑道的现有计划，给定候选航班号、
+   尾流等级与带时区的 `[最早, 最晚]` 离场区间（含两端、整秒），**保持现有航班时刻不变**，
+   按 `(离场时刻, 航班号)` 确定插入位次，求区间内**最早可行的 UTC 时刻**——需同时满足
+   插入前后相邻尾流间隔、关闭窗口避让与**插入后全序列**的滚动容量。现有计划本身违反
+   约束时返回 `422`（附违规明细）；找不到时返回明确的无空档结果（`feasible=false`）。
+   该接口**不改写计划、也不落批次**。
 
 **兼容形状**：未在任何航班上传 `locked` 字段时，validate/trial/批次回查的响应与旧版本
 完全一致（不出现 `locked`、`locked_flights`、`blocked`、`total_locked` 字段）；显式传了
 `locked`（即使都是 `false`）才回显锁定相关字段。
 
-每次请求（含输入排序结果、关闭窗口、容量配置、违规/冲突/试排结论）都会持久化到 SQLite，
-可用批次 ID 回查。
+除插空查询（只读）外，每次请求（含输入排序结果、关闭窗口、容量配置、违规/冲突/试排结论）
+都会持久化到 SQLite，可用批次 ID 回查。
 
 ---
 
@@ -353,6 +359,83 @@ validate 额外返回**关闭冲突**：凡计划离场时刻落在某个窗口�
 结果以 `mode="joint_trial"` 持久化（输入计划、全局顺序、互斥组、可行前缀每项明细
 与 blocker 的各约束所需时刻一并入库），可用批次 ID 原样回查。
 
+### `POST /api/v1/slots/insert` — 单跑道插空查询（纯查询）
+
+针对**单条跑道**的现有计划，查询一架候选航班在指定时间窗内的**最早可行离场时刻**。
+请求体（完整示例见随仓库提供的 `sample-insert.json`）：
+
+```json
+{
+  "runway": {
+    "runway": "36L",
+    "flights": [
+      {"flight_no": "CA101", "scheduled_off": "2026-09-18T08:00:00+08:00", "wake": "H"},
+      {"flight_no": "CA102", "scheduled_off": "2026-09-18T08:05:00+08:00", "wake": "M"},
+      {"flight_no": "CA103", "scheduled_off": "2026-09-18T08:10:00+08:00", "wake": "M"}
+    ],
+    "closures": [
+      {"start": "2026-09-18T08:02:00+08:00", "end": "2026-09-18T08:03:00+08:00"}
+    ],
+    "capacity": {"window_seconds": 600, "max_departures": 3}
+  },
+  "candidate": {
+    "flight_no": "CA999",
+    "wake": "M",
+    "earliest_off": "2026-09-18T08:01:00+08:00",
+    "latest_off": "2026-09-18T08:09:00+08:00"
+  }
+}
+```
+
+- `runway`：与 validate/trial 相同的单跑道对象（`flights` / `closures` / `capacity`，
+  校验规则一致：跑道内航班号唯一、关闭窗口 `[start, end)` 不重叠、容量为正整数）；
+  `locked` 字段可携带但不影响本接口（现有时刻一律保持不变）。
+- `matrix`（可选）：与 validate/trial 相同的间隔矩阵覆盖，规则一致。
+- `candidate`：候选航班。
+  - `flight_no`：候选航班号，**不得与现有航班重复**（`422`）；
+  - `wake`：候选尾流等级（`L` / `M` / `H` / `J`）；
+  - `earliest_off` / `latest_off`：可接受的离场时刻区间，ISO 8601 且**必须带时区**、
+    **精确到整秒**（亚秒会被拒绝，`422`）；**区间含两端**，二者相等表示只接受单一时刻，
+    `latest_off` 早于 `earliest_off` 返回 `422`。
+
+#### 判定规则
+
+1. **先校验现有计划**：若提交的现有航班本身已违反尾流间隔、关闭窗口或滚动容量约束，
+   返回 `422`，`detail` 中按 `wake_violations` / `closure_conflicts` /
+   `capacity_violations` 分组列出全部违规明细（字段同 validate 响应）。
+2. **现有航班时刻保持不变**，候选航班的插入位次按其 `(离场时刻, 航班号)` 在稳定顺序中
+   确定（与现有航班同时刻时按航班号决先后）。
+3. 求区间内**最早可行**的 UTC 时刻 `t`，需同时满足：
+   - 与**前一架**的尾流间隔：`t >= 前机时刻 + 矩阵(前机尾流 → 候选尾流)`；
+   - 与**后一架**的尾流间隔：`t <= 后机时刻 - 矩阵(候选尾流 → 后机尾流)`；
+   - 不落入任何关闭窗口（落入则推迟到窗口 `end`，首尾相接的窗口连续避让）；
+   - **插入后全序列**的滚动容量：候选航班作为跟随者（不早于前方第 `max_departures`
+     架 + `window_seconds`）、作为锚机（后方第 `max_departures` 架不早于
+     `t + window_seconds`），且插入后位次后移的现有航班与其新锚机同样满足窗口约束。
+4. 任一插入位次都不可行时返回**明确的无空档结果**（HTTP 200，`feasible=false`）。
+
+#### 响应
+
+可行（`feasible=true`）时：
+
+| 字段 | 含义 |
+| --- | --- |
+| `slot_off` | 区间内最早可行的 UTC 时刻（`Z` 后缀） |
+| `position` | 候选航班在插入后序列中的位次（1 基） |
+| `order` | 插入后的完整离场序列（含候选航班号） |
+| `predecessor` / `successor` | 插入位次前后紧邻的现有航班：`flight_no` / `wake` / `scheduled_off` / `required_seconds`（所需尾流间隔）/ `actual_seconds`（插入时刻下的实际间隔）；位于首/尾时为 `null` |
+
+不可行时：`feasible=false`、`slot_off` / `position` / `predecessor` / `successor`
+均为 `null`，`order` 为现有稳定序列，`reason` 给出无空档说明。无论可行与否都回显
+`runway`、生效的 `matrix`、候选航班号/尾流等级与归一化为 UTC 的
+`earliest_off` / `latest_off`。
+
+> 上例的查询结果：`earliest_off`（08:01 +08:00）先被 H→M 的 120 秒尾流间隔推到
+> 08:02:00，再因落入关闭窗口 `[08:02, 08:03)` 避让到 **`2026-09-18T00:03:00Z`**
+> （即 08:03:00+08:00），`position=2`。
+
+本接口为**纯查询**：不改写现有计划、不产生 `batch_id`，也不写入任何批次数据。
+
 ### `GET /api/v1/batches/{batch_id}` — 批次回查
 
 所有 POST 接口（validate / trial / best-adjacent-swap / joint）的返回都带 `batch_id`，
@@ -396,7 +479,9 @@ capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的�
   关闭窗口结束不晚于开始或彼此重叠、容量字段非正整数、`locked` 非布尔值、
   互斥组引用不存在的跑道/组内跑道重复/同一跑道属于多个组/组少于 2 条跑道/
   组名重复/组间隔非正整数等），或 best-adjacent-swap 请求含任意 `locked=true`
-  航班，响应体含中文原因。
+  航班，或插空查询的候选航班号与现有航班重复/候选区间倒置或带亚秒/
+  **现有计划本身违反尾流、关闭窗口或容量约束**，响应体含中文原因
+  （现有计划违规时 `detail` 附分组违规明细）。
 - `404`：批次 ID 不存在。
 
 ---
@@ -432,12 +517,19 @@ curl -s -X POST http://localhost:8000/api/v1/trial/joint \
           {"flight_no": "MU1", "scheduled_off": "2026-09-18T00:00:30Z", "wake": "H"}]}],
        "groups": [{"runways": ["36L", "18R"], "min_interval_seconds": 90}]}'
 
+# 单跑道插空查询（候选 CA999 在 08:01–08:09 +08:00 内的最早可行时刻）
+curl -s -X POST http://localhost:8000/api/v1/slots/insert \
+  -H 'Content-Type: application/json' \
+  -d @sample-insert.json
+
 # 回查批次
 curl -s http://localhost:8000/api/v1/batches/<batch_id>
 ```
 
 `sample.json` 已随仓库提供（36L 跑道含关闭窗口与「10 分钟内最多 3 架」滚动容量约束，
-首航 CA101 标记为 `locked`；18R 跑道含关闭窗口），可直接使用。
+首航 CA101 标记为 `locked`；18R 跑道含关闭窗口），可直接使用；`sample-insert.json`
+为插空查询示例（36L 三架现有航班 + 关闭窗口 + 滚动容量，候选 CA999 时间窗
+08:01–08:09 +08:00，期望最早可行时刻 `2026-09-18T00:03:00Z`）。
 
 ---
 
@@ -451,7 +543,7 @@ export WAKE_DB_PATH=./wake.db            # 可选，默认 /data/wake.db
 uvicorn app.main:app --reload --port 8000
 ```
 
-运行测试（含 119 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
+运行测试（含 141 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
 
 ```bash
 python3 -m pip install pytest httpx
@@ -462,11 +554,11 @@ python3 -m pytest -q
 
 ```
 app/
-  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / trial/joint / batches / 元信息）
-  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定/互斥组合法性与兼容序列化）
-  service.py      # 请求 -> 领域对象 -> 模式计算
+  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / trial/joint / slots/insert / batches / 元信息）
+  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定/互斥组/候选航班合法性与兼容序列化）
+  service.py      # 请求 -> 领域对象 -> 模式计算（含插空查询的现有计划校验 ExistingPlanInvalid）
   joint.py        # 联合试排：全局稳定顺序、尾流/关闭/容量/互斥组间隔不动点迭代、锁定阻塞与各约束所需时刻
-  separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、锁定航班可行性（blocker）、相邻交换枚举择优、默认矩阵
+  separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、锁定航班可行性（blocker）、相邻交换枚举择优、单跑道插空查询、默认矩阵
   timeutils.py    # 时区归一化（统一 UTC，整数秒运算）
   database.py     # SQLite 连接、建表与旧库迁移（含 batches.mode CHECK 重建、互斥组表与联合试排列）
   repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排/交换/联合试排（含互斥组与各约束所需时刻）的持久化与回查
@@ -475,5 +567,6 @@ tests/            # pytest 领域单测 + TestClient API 测试
 Dockerfile
 docker-compose.yml
 sample.json       # 含关闭窗口与滚动容量约束的示例请求
+sample-insert.json # 单跑道插空查询示例请求
 requirements.txt
 ```

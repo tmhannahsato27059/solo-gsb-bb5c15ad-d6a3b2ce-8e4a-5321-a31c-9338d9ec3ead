@@ -270,6 +270,82 @@ class JointTrialRequest(WakeRequest):
         ]
 
 
+class CandidateFlightIn(BaseModel):
+    """候选航班：待插入的航班号、尾流等级与可接受的离场时刻区间。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    flight_no: str = Field(..., min_length=1, examples=["CA999"])
+    wake: Wake = Field(
+        ..., description="候选航班尾流等级: L 轻型 / M 中型 / H 重型 / J 超重型"
+    )
+    earliest_off: datetime = Field(
+        ...,
+        description="可接受的最早离场时刻（含），ISO 8601，必须带时区，精确到整秒",
+    )
+    latest_off: datetime = Field(
+        ...,
+        description="可接受的最晚离场时刻（含），ISO 8601，必须带时区，精确到整秒",
+    )
+
+    @field_validator("flight_no")
+    @classmethod
+    def _strip_flight_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("flight_no 不能为空")
+        return v
+
+    @field_validator("earliest_off", "latest_off")
+    @classmethod
+    def _require_timezone_whole_second(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("候选时刻必须携带时区信息（ISO 8601 offset 或 Z）")
+        if v.microsecond:
+            raise ValueError("候选时刻必须精确到整秒（不允许毫秒/微秒）")
+        return v
+
+    @model_validator(mode="after")
+    def _window_not_inverted(self) -> CandidateFlightIn:
+        if self.latest_off < self.earliest_off:
+            raise ValueError(
+                "候选最晚离场时刻不得早于最早离场时刻（区间含两端，二者可相等）"
+            )
+        return self
+
+
+class SlotInsertRequest(BaseModel):
+    """单跑道插空查询：现有计划 + 候选航班，求区间内最早可行时刻。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    runway: RunwayIn = Field(
+        ..., description="单条跑道的现有航班、关闭窗口与滚动容量约束"
+    )
+    matrix: list[MatrixEntryIn] | None = Field(
+        default=None,
+        description="前机—后机最小间隔矩阵；缺省使用内置 ICAO 风格默认矩阵。"
+        "提供时仅列出的组合生效，未列出的组合视为无最小间隔(0 秒)。",
+    )
+    candidate: CandidateFlightIn
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> SlotInsertRequest:
+        existing = {f.flight_no for f in self.runway.flights}
+        if self.candidate.flight_no in existing:
+            raise ValueError(f"候选航班号与现有航班重复: {self.candidate.flight_no}")
+        if self.matrix is not None:
+            pairs: set[tuple[str, str]] = set()
+            for entry in self.matrix:
+                pair = (entry.leader.value, entry.follower.value)
+                if pair in pairs:
+                    raise ValueError(
+                        f"间隔矩阵组合重复: leader={pair[0]} follower={pair[1]}"
+                    )
+                pairs.add(pair)
+        return self
+
+
 # ---------- response models ----------
 
 
@@ -947,6 +1023,34 @@ class JointTrialResponse(BaseModel):
         if self.has_locks:
             data["total_locked"] = self.total_locked
         return data
+
+
+class SlotNeighborOut(BaseModel):
+    """插入位次上紧邻的现有航班及其与候选航班之间的尾流间隔。"""
+
+    flight_no: str
+    wake: Wake
+    scheduled_off: datetime
+    required_seconds: int
+    actual_seconds: int
+
+
+class SlotInsertResponse(BaseModel):
+    """插空查询结果；纯查询接口，不落批次（无 batch_id）。"""
+
+    runway: str
+    matrix: dict[str, dict[str, int]]
+    candidate_flight_no: str
+    candidate_wake: Wake
+    earliest_off: datetime
+    latest_off: datetime
+    feasible: bool
+    slot_off: datetime | None
+    position: int | None
+    order: list[str]
+    predecessor: SlotNeighborOut | None
+    successor: SlotNeighborOut | None
+    reason: str | None
 
 
 class MatrixOut(BaseModel):

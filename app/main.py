@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -32,6 +33,9 @@ from .schemas import (
     RunwaySwapOut,
     RunwayTrialOut,
     RunwayJointOut,
+    SlotInsertRequest,
+    SlotInsertResponse,
+    SlotNeighborOut,
     SwapChoiceOut,
     TrialBlockedOut,
     TrialItemOut,
@@ -42,12 +46,15 @@ from .schemas import (
 )
 from .separation import ClosureWindow, delay_stats
 from .service import (
+    ExistingPlanInvalid,
     nested_matrix,
     run_best_adjacent_swap,
     run_joint_trial,
+    run_slot_insert,
     run_trial,
     run_validate,
 )
+from .timeutils import ensure_utc
 from .config import settings
 
 
@@ -72,8 +79,13 @@ app = FastAPI(
         "确定跨跑道全局稳定顺序，再逐项求同时满足本跑道尾流/关闭窗口/滚动"
         "容量与组内最小占用间隔的最早时刻（任一约束推迟后全部约束重新检查"
         "直至收敛），锁定航班需要后移时返回首个阻塞航班及各约束所需时刻。"
+        "slots/insert 单跑道插空查询：保持现有航班时刻不变，按 (离场时刻, "
+        "航班号) 确定候选航班的插入位次，求 [最早, 最晚]（含两端、整秒）内"
+        "最早可行时刻——同时满足插入前后相邻尾流间隔、关闭窗口避让与插入后"
+        "全序列滚动容量；现有计划本身违规返回 422，无空档时返回明确结果。"
+        "纯查询，不改写计划也不落批次。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -82,6 +94,67 @@ app = FastAPI(
 async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
     """Pydantic 之外可能抛出的领域校验错误统一为 400。"""
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+def _iso_z(dt: datetime) -> str:
+    """UTC ISO-8601 with the ``Z`` suffix, matching response serialisation."""
+    return ensure_utc(dt).isoformat().replace("+00:00", "Z")
+
+
+@app.exception_handler(ExistingPlanInvalid)
+async def existing_plan_invalid_handler(
+    request: Request, exc: ExistingPlanInvalid
+) -> JSONResponse:
+    """插空查询的现有计划本身违反约束：422 并列出全部违规明细。"""
+    detail = {
+        "message": "现有计划违反尾流间隔、关闭窗口或滚动容量约束，无法进行插空查询",
+        "wake_violations": [
+            {
+                "leader": v.leader_no,
+                "follower": v.follower_no,
+                "leader_wake": v.leader_wake,
+                "follower_wake": v.follower_wake,
+                "leader_scheduled_off": _iso_z(v.leader_time),
+                "follower_scheduled_off": _iso_z(v.follower_time),
+                "required_seconds": v.required_seconds,
+                "actual_seconds": v.actual_seconds,
+                "shortfall_seconds": v.shortfall_seconds,
+                "leader_position": v.leader_position,
+                "follower_position": v.follower_position,
+            }
+            for v in exc.violations
+        ],
+        "closure_conflicts": [
+            {
+                "flight_no": c.flight_no,
+                "wake": c.wake,
+                "scheduled_off": _iso_z(c.scheduled_off),
+                "position": c.position,
+                "window_index": c.window_index,
+                "window_start": _iso_z(c.window_start),
+                "window_end": _iso_z(c.window_end),
+            }
+            for c in exc.closure_conflicts
+        ],
+        "capacity_violations": [
+            {
+                "flight_no": cv.flight_no,
+                "wake": cv.wake,
+                "scheduled_off": _iso_z(cv.scheduled_off),
+                "position": cv.position,
+                "window_seconds": cv.window_seconds,
+                "max_departures": cv.max_departures,
+                "departures_in_window": cv.departures_in_window,
+                "anchor_flight_no": cv.anchor_flight_no,
+                "anchor_position": cv.anchor_position,
+                "window_start": _iso_z(cv.anchor_off),
+                "window_end": _iso_z(cv.window_end),
+                "earliest_compliant_off": _iso_z(cv.earliest_compliant_off),
+            }
+            for cv in exc.capacity_violations
+        ],
+    }
+    return JSONResponse(status_code=422, content={"detail": detail})
 
 
 @app.get("/", tags=["meta"])
@@ -96,6 +169,7 @@ def root() -> dict:
             "trial": "POST /api/v1/trial",
             "best_adjacent_swap": "POST /api/v1/trial/best-adjacent-swap",
             "joint_trial": "POST /api/v1/trial/joint",
+            "slot_insert": "POST /api/v1/slots/insert",
             "batch": "GET /api/v1/batches/{batch_id}",
         },
     }
@@ -779,6 +853,51 @@ def joint_trial_endpoint(
         runways=runway_outs,
         has_locks=bool(locked_runways),
         total_locked=total_locked,
+    )
+
+
+def _slot_neighbor_out(neighbor) -> SlotNeighborOut | None:
+    if neighbor is None:
+        return None
+    return SlotNeighborOut(
+        flight_no=neighbor.flight_no,
+        wake=neighbor.wake,
+        scheduled_off=neighbor.scheduled_off,
+        required_seconds=neighbor.required_seconds,
+        actual_seconds=neighbor.actual_seconds,
+    )
+
+
+@app.post("/api/v1/slots/insert", response_model=SlotInsertResponse, tags=["slots"])
+def slot_insert(req: SlotInsertRequest) -> SlotInsertResponse:
+    """单跑道插空查询（纯查询，不改写计划、不落批次）。
+
+    保持现有航班时刻不变，按 (离场时刻, 航班号) 的稳定顺序确定候选航班的
+    插入位次，求 [earliest_off, latest_off]（含两端、精确到整秒）内最早
+    可行的 UTC 时刻：需同时满足插入前后相邻尾流间隔、关闭窗口避让与插入
+    后全序列的滚动容量。现有计划本身违反上述约束时返回 422（附违规明细）；
+    区间内无可行时刻时返回 feasible=false 的明确无空档结果。
+    """
+    matrix, result = run_slot_insert(req)
+    return SlotInsertResponse(
+        runway=req.runway.runway,
+        matrix=nested_matrix(matrix),
+        candidate_flight_no=req.candidate.flight_no,
+        candidate_wake=req.candidate.wake,
+        earliest_off=ensure_utc(req.candidate.earliest_off),
+        latest_off=ensure_utc(req.candidate.latest_off),
+        feasible=result.feasible,
+        slot_off=result.off_time,
+        position=result.position,
+        order=result.order,
+        predecessor=_slot_neighbor_out(result.predecessor),
+        successor=_slot_neighbor_out(result.successor),
+        reason=(
+            None
+            if result.feasible
+            else "候选时间窗内无可行时刻：插入后需同时满足相邻尾流间隔、"
+            "关闭窗口避让与全序列滚动容量约束"
+        ),
     )
 
 

@@ -549,6 +549,164 @@ def trial_reschedule(
 
 
 @dataclass(frozen=True, slots=True)
+class SlotNeighbor:
+    """The existing departure immediately before/after an inserted candidate.
+
+    ``required_seconds`` is the matrix gap the pair must keep (leader ->
+    follower direction depends on which side the neighbour is on);
+    ``actual_seconds`` is the gap at the proposed insertion time.
+    """
+
+    flight_no: str
+    wake: str
+    scheduled_off: datetime
+    required_seconds: int
+    actual_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class InsertSlotResult:
+    """Outcome of a slot-insertion query on one runway.
+
+    ``order`` is the merged departure sequence (existing flights plus the
+    candidate) when a feasible slot exists, otherwise the existing stable
+    order. ``position`` is the candidate's 1-based slot in the merged
+    order. Existing flights are never moved and nothing is persisted.
+    """
+
+    feasible: bool
+    order: list[str]
+    off_time: datetime | None  # earliest feasible UTC instant
+    position: int | None
+    predecessor: SlotNeighbor | None
+    successor: SlotNeighbor | None
+
+
+def find_insert_slot(
+    flights: list[Flight],
+    matrix: dict[tuple[str, str], int],
+    windows: list[ClosureWindow] | None = None,
+    capacity: Capacity | None = None,
+    *,
+    candidate_no: str,
+    candidate_wake: str,
+    earliest: int,
+    latest: int,
+) -> InsertSlotResult:
+    """Earliest instant in ``[earliest, latest]`` at which a candidate can
+    be inserted into a fixed, already feasible schedule.
+
+    Bounds are whole POSIX seconds and the interval includes both ends.
+    Existing flights keep their times; the candidate's insertion index is
+    the one its ``(time, flight_no)`` key earns in the stable order, so
+    every possible index ``i`` contributes a (possibly empty) interval:
+
+    * the index interval itself — strictly between the neighbours'
+      ``(time, flight_no)`` keys, with same-time ties broken by flight
+      number;
+    * wake separation against the predecessor (``t >= prev + gap``) and
+      the successor (``t <= next - gap``);
+    * the rolling capacity of the *merged* sequence: the candidate as
+      follower (``t >= ordered[i-k] + W``), the candidate as anchor
+      (``t <= ordered[i+k-1] - W``), and the existing flights up to
+      ``k-1`` slots behind the insertion point whose anchor moves one
+      slot closer (distance-``k-1`` pairs the old plan never checked —
+      a per-index feasibility test independent of ``t``);
+    * outside every closure window (pushed to the window's end, chaining
+      over touching windows, while staying inside the index interval).
+
+    The smallest feasible ``t`` across all indices wins; ties are
+    impossible because ``t`` determines the index. When no index yields a
+    feasible instant the result is ``feasible=False`` with the existing
+    stable order.
+    """
+    ordered = sort_flights(flights)
+    wins = sort_windows(windows or [])
+    n = len(ordered)
+    k = capacity.max_departures if capacity is not None else 0
+    window_seconds = capacity.window_seconds if capacity is not None else 0
+
+    best_t: int | None = None
+    best_i = 0
+    for i in range(n + 1):
+        lo = earliest
+        hi = latest
+        if i > 0:
+            prev = ordered[i - 1]
+            # strictly after (prev.t, prev.flight_no)
+            lo = max(lo, prev.t if candidate_no > prev.flight_no else prev.t + 1)
+            lo = max(lo, prev.t + required_gap(matrix, prev.wake, candidate_wake))
+            if capacity is not None and i >= k:
+                lo = max(lo, ordered[i - k].t + window_seconds)
+        if i < n:
+            nxt = ordered[i]
+            # strictly before (nxt.t, nxt.flight_no)
+            hi = min(hi, nxt.t if candidate_no < nxt.flight_no else nxt.t - 1)
+            hi = min(hi, nxt.t - required_gap(matrix, candidate_wake, nxt.wake))
+            if capacity is not None and i + k <= n:
+                hi = min(hi, ordered[i + k - 1].t - window_seconds)
+        if capacity is not None and any(
+            ordered[j - 1].t - ordered[j - k].t < window_seconds
+            for j in range(max(i + 1, k), min(i + k, n + 1))
+        ):
+            continue  # an existing flight's anchor would move too close
+        if lo > hi:
+            continue
+        t = lo
+        for window in wins:
+            if t < window.s:
+                break  # in the open gap before this and every later window
+            if window.contains(t):
+                t = window.e
+        if t > hi:
+            continue
+        if best_t is None or t < best_t:
+            best_t = t
+            best_i = i
+
+    if best_t is None:
+        return InsertSlotResult(
+            feasible=False,
+            order=[f.flight_no for f in ordered],
+            off_time=None,
+            position=None,
+            predecessor=None,
+            successor=None,
+        )
+
+    merged = [f.flight_no for f in ordered]
+    merged.insert(best_i, candidate_no)
+    predecessor = None
+    if best_i > 0:
+        prev = ordered[best_i - 1]
+        predecessor = SlotNeighbor(
+            flight_no=prev.flight_no,
+            wake=prev.wake,
+            scheduled_off=prev.scheduled_off,
+            required_seconds=required_gap(matrix, prev.wake, candidate_wake),
+            actual_seconds=best_t - prev.t,
+        )
+    successor = None
+    if best_i < n:
+        nxt = ordered[best_i]
+        successor = SlotNeighbor(
+            flight_no=nxt.flight_no,
+            wake=nxt.wake,
+            scheduled_off=nxt.scheduled_off,
+            required_seconds=required_gap(matrix, candidate_wake, nxt.wake),
+            actual_seconds=nxt.t - best_t,
+        )
+    return InsertSlotResult(
+        feasible=True,
+        order=merged,
+        off_time=datetime.fromtimestamp(best_t, tz=timezone.utc),
+        position=best_i + 1,
+        predecessor=predecessor,
+        successor=successor,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class AdjacentSwap:
     """The chosen adjacent swap, addressed against the baseline stable order.
 
